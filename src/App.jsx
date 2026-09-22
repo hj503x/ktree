@@ -24,7 +24,7 @@ const STYLE = `
     radial-gradient(circle at 1px 1px, var(--grain) 1px, transparent 0) 0 0/16px 16px,
     var(--paper);
   color: var(--ink);
-  min-height: 100%;
+  min-height: 100vh;
   width: 100%;
   position: relative;
   transition: background 0.2s ease, color 0.2s ease;
@@ -205,8 +205,31 @@ const STYLE = `
 
 .ktree-loading { padding: 80px 20px; text-align: center; color: var(--ink-soft); font-size: 14px; }
 
+.ktree-field textarea {
+  width: 100%; font-family: 'Inter', sans-serif; font-size: 14px; padding: 9px 11px;
+  border: 1px solid var(--line); border-radius: 3px; background: var(--card); color: var(--ink);
+  outline: none; resize: vertical; min-height: 64px;
+}
+.ktree-field textarea:focus { border-color: var(--brass); }
+.ktree-field-hint { font-size: 12px; color: var(--ink-soft); margin-top: 6px; line-height: 1.4; }
+
+.ktree-toast {
+  position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+  background: var(--ink); color: var(--paper); font-size: 13.5px;
+  padding: 10px 10px 10px 16px; border-radius: 4px; display: flex; align-items: center; gap: 14px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.3); z-index: 60; max-width: 90vw;
+}
+.ktree-toast-undo { background: none; border: none; color: var(--brass); font-weight: 600; cursor: pointer; font-size: 13.5px; font-family: 'Inter', sans-serif; flex-shrink: 0; }
+.ktree-toast-close { background: none; border: none; color: var(--paper); opacity: 0.65; cursor: pointer; display: flex; flex-shrink: 0; padding: 2px; }
+.ktree-toast-close:hover { opacity: 1; }
+
+.ktree-backup-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+.ktree-backup-item:last-child { border-bottom: none; }
+.ktree-backup-meta { color: var(--ink-soft); }
+.ktree-backup-empty { font-size: 13.5px; color: var(--ink-soft); font-style: italic; padding: 6px 0; }
+
 @media print {
-  .ktree-header-actions, .ktree-toolbar, .ktree-legend, .ktree-sync-note, .ktree-zoom-bar, .ktree-overlay { display: none !important; }
+  .ktree-header-actions, .ktree-toolbar, .ktree-legend, .ktree-sync-note, .ktree-zoom-bar, .ktree-overlay, .ktree-toast { display: none !important; }
   .ktree-canvas-wrap { overflow: visible !important; padding: 0 !important; }
   .ktree-root { background: white !important; }
 }
@@ -233,7 +256,29 @@ function normalizePeople(list) {
     ...p,
     parents: p.parents || [],
     partners: (p.partners || []).map((x) => (typeof x === "string" ? { id: x, status: "married" } : x)),
+    notes: p.notes || "",
   }));
+}
+
+// id + every descendant of id (children, grandchildren, ...). Used to stop someone
+// from being set as their own ancestor, which would otherwise loop the layout forever.
+function descendantIds(id, people) {
+  const seen = new Set([id]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    people.forEach((p) => {
+      if (!seen.has(p.id) && (p.parents || []).some((pid) => seen.has(pid))) {
+        seen.add(p.id);
+        changed = true;
+      }
+    });
+  }
+  return seen;
+}
+
+function sameName(a, b) {
+  return (a || "").trim().toLowerCase() === (b || "").trim().toLowerCase();
 }
 
 function relaxGenerations(people) {
@@ -389,7 +434,29 @@ function downloadFile(filename, content, mime) {
   URL.revokeObjectURL(url);
 }
 
-const STATUS_LABEL = { married: "Together", divorced: "Divorced", widowed: "Widowed" };
+const STATUS_LABEL = { married: "Married", partnered: "Partnered", divorced: "Divorced", widowed: "Widowed" };
+const BACKUP_KEY = "ktree_backups";
+const MAX_BACKUPS = 5;
+
+function loadBackups() {
+  try {
+    const raw = localStorage.getItem(BACKUP_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+// keep a rolling snapshot of the tree *before* structural changes (add/delete/import),
+// stored under a separate key so a bad localStorage write to the main key, or an
+// accidental edit, isn't the only copy of the data.
+function pushBackup(peopleSnapshot) {
+  try {
+    const list = loadBackups();
+    list.unshift({ ts: Date.now(), people: peopleSnapshot });
+    localStorage.setItem(BACKUP_KEY, JSON.stringify(list.slice(0, MAX_BACKUPS)));
+  } catch (e) {}
+}
 
 export default function KtreeApp() {
   const [people, setPeople] = useState([]);
@@ -401,6 +468,9 @@ export default function KtreeApp() {
   const [layoutTick, setLayoutTick] = useState(0);
   const [zoom, setZoom] = useState(1);
   const [linkPartnerSel, setLinkPartnerSel] = useState("");
+  const [undoState, setUndoState] = useState(null); // { label, prevPeople }
+  const [showBackups, setShowBackups] = useState(false);
+  const undoTimerRef = useRef(null);
 
   const containerRef = useRef(null);
   const canvasRef = useRef(null);
@@ -442,11 +512,59 @@ export default function KtreeApp() {
     });
   }, [persist]);
 
+  const pushUndo = useCallback((label, prevPeople) => {
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    setUndoState({ label, prevPeople });
+    undoTimerRef.current = setTimeout(() => setUndoState(null), 7000);
+  }, []);
+  const restoreUndo = useCallback(() => {
+    setUndoState((cur) => {
+      if (cur) updatePeople(cur.prevPeople);
+      return null;
+    });
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+  }, [updatePeople]);
+
   const byId = useMemo(() => Object.fromEntries(people.map((p) => [p.id, p])), [people]);
   const gens = useMemo(() => relaxGenerations(people), [people]);
   const rows = useMemo(() => groupIntoRows(people, gens), [people, gens]);
   const units = useMemo(() => familyUnits(people), [people]);
+  const q = useMemo(() => query.trim().toLowerCase(), [query]);
   const childrenOf = useCallback((id) => people.filter((p) => (p.parents || []).includes(id)), [people]);
+  // mode "any" (default, used for cousin lookups) counts anyone sharing at least one
+  // parent; "full" requires the exact same parent set; "half" is "any" minus "full".
+  const siblingsOf = useCallback((id, mode = "any") => {
+    const person = byId[id];
+    if (!person || !(person.parents || []).length) return [];
+    const pSet = new Set(person.parents);
+    return people.filter((p) => {
+      if (p.id === id) return false;
+      const shared = (p.parents || []).some((pid) => pSet.has(pid));
+      if (!shared) return false;
+      if (mode === "any") return true;
+      const pParents = p.parents || [];
+      const isFull = person.parents.length > 1 && pParents.length > 1 &&
+        person.parents.every((pid) => pParents.includes(pid)) &&
+        pParents.every((pid) => person.parents.includes(pid));
+      return mode === "full" ? isFull : !isFull;
+    });
+  }, [people, byId]);
+  const cousinsOf = useCallback((id) => {
+    const person = byId[id];
+    if (!person) return [];
+    const auntsUncles = new Set();
+    (person.parents || []).forEach((pid) => siblingsOf(pid).forEach((s) => auntsUncles.add(s.id)));
+    const seen = new Map();
+    auntsUncles.forEach((auId) => childrenOf(auId).forEach((c) => { if (c.id !== id) seen.set(c.id, c); }));
+    return Array.from(seen.values());
+  }, [byId, siblingsOf, childrenOf]);
+
+  // when editing an existing person, none of their own descendants can be picked as
+  // a parent (that would make them their own ancestor and loop the generation layout)
+  const blockedParentIds = useMemo(() => {
+    if (!form || form.mode !== "edit") return new Set();
+    return descendantIds(form.id, people);
+  }, [form, people]);
 
   // ---- layout / connectors ----
   useLayoutEffect(() => {
@@ -516,6 +634,27 @@ export default function KtreeApp() {
     return () => { window.removeEventListener("resize", onResize); if (ro) ro.disconnect(); };
   }, []);
 
+  // scroll the first match into view so search is actually useful on a big tree
+  useEffect(() => {
+    if (!q) return;
+    const match = people.find((p) => p.name.toLowerCase().includes(q));
+    if (!match) return;
+    const el = cardRefs.current.get(match.id);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+  }, [q, people]);
+
+  // Escape closes whichever overlay is open (form takes priority over the detail panel)
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      if (form) setForm(null);
+      else if (showBackups) setShowBackups(false);
+      else if (selectedId) setSelectedId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [form, showBackups, selectedId]);
+
   // ---- pan (drag background to scroll) ----
   const onWrapMouseDown = (e) => {
     if (e.target.closest(".ktree-card")) return;
@@ -545,7 +684,7 @@ export default function KtreeApp() {
 
   // ---- form ----
   const openAdd = (prefill = {}) => {
-    setForm({ mode: "add", values: { name: "", birthYear: "", deathYear: "", parent1: "", parent2: "", partnerId: "", photo: "", ...prefill } });
+    setForm({ mode: "add", values: { name: "", birthYear: "", deathYear: "", parent1: "", parent2: "", partnerId: "", photo: "", notes: "", ...prefill } });
   };
   const openEdit = (person) => {
     setForm({
@@ -553,7 +692,7 @@ export default function KtreeApp() {
       values: {
         name: person.name || "", birthYear: person.birthYear || "", deathYear: person.deathYear || "",
         parent1: (person.parents || [])[0] || "", parent2: (person.parents || [])[1] || "",
-        partnerId: "", photo: person.photo || "",
+        partnerId: "", photo: person.photo || "", notes: person.notes || "",
       },
     });
   };
@@ -573,12 +712,12 @@ export default function KtreeApp() {
     const v = form.values;
     const name = v.name.trim();
     if (!name) return;
-    const parents = [v.parent1, v.parent2].filter(Boolean);
+    let parents = [v.parent1, v.parent2].filter(Boolean);
     const newPartner = v.partnerId || null;
 
     if (form.mode === "add") {
       const id = uid();
-      const person = { id, name, birthYear: v.birthYear.trim(), deathYear: v.deathYear.trim(), photo: v.photo || "", parents, partners: [] };
+      const person = { id, name, birthYear: v.birthYear.trim(), deathYear: v.deathYear.trim(), photo: v.photo || "", notes: v.notes.trim(), parents, partners: [] };
       updatePeople((prev) => {
         let next = [...prev, person];
         if (newPartner) {
@@ -593,9 +732,13 @@ export default function KtreeApp() {
       setSelectedId(id);
     } else {
       const id = form.id;
+      // defensive: dropdowns already exclude these, but double-check before saving
+      // so a stale form state can never make someone their own ancestor
+      const blocked = descendantIds(id, people);
+      parents = parents.filter((pid) => !blocked.has(pid));
       updatePeople((prev) =>
         prev.map((p) => (p.id === id
-          ? { ...p, name, birthYear: v.birthYear.trim(), deathYear: v.deathYear.trim(), photo: v.photo || "", parents }
+          ? { ...p, name, birthYear: v.birthYear.trim(), deathYear: v.deathYear.trim(), photo: v.photo || "", notes: v.notes.trim(), parents }
           : p))
       );
     }
@@ -603,6 +746,9 @@ export default function KtreeApp() {
   };
 
   const deletePerson = (id) => {
+    const person = byId[id];
+    const prevSnapshot = people;
+    pushBackup(prevSnapshot);
     updatePeople((prev) =>
       prev.filter((p) => p.id !== id).map((p) => ({
         ...p,
@@ -610,6 +756,7 @@ export default function KtreeApp() {
         partners: (p.partners || []).filter((x) => x.id !== id),
       }))
     );
+    pushUndo(`Deleted ${person?.name || "person"}`, prevSnapshot);
     if (selectedId === id) setSelectedId(null);
   };
 
@@ -653,7 +800,12 @@ export default function KtreeApp() {
       const data = normalizePeople(JSON.parse(text));
       if (!Array.isArray(data)) throw new Error("bad format");
       const ok = window.confirm(`Import ${data.length} people? This replaces your current tree (export first if unsure).`);
-      if (ok) updatePeople(data);
+      if (ok) {
+        const prevSnapshot = people;
+        pushBackup(prevSnapshot);
+        updatePeople(data);
+        pushUndo("Replaced tree via JSON import", prevSnapshot);
+      }
     } catch (e) {
       window.alert("That file couldn't be read as a Ktree JSON export.");
     }
@@ -664,14 +816,42 @@ export default function KtreeApp() {
       const text = await file.text();
       const imported = parseGedcom(text);
       if (imported.length === 0) { window.alert("No individuals found in that GEDCOM file."); return; }
-      updatePeople((prev) => [...prev, ...imported]);
+
+      // flag likely duplicates of people already in the tree (same name, and either
+      // birth year matches or one side just doesn't have one) so a re-import doesn't
+      // silently double everyone up
+      const dupes = imported.filter((ip) =>
+        people.some((ep) => sameName(ep.name, ip.name) && (!ip.birthYear || !ep.birthYear || ip.birthYear === ep.birthYear))
+      );
+      let toAdd = imported;
+      if (dupes.length > 0) {
+        const names = dupes.slice(0, 8).map((d) => d.name).join(", ") + (dupes.length > 8 ? ", …" : "");
+        const skipDupes = window.confirm(
+          `${dupes.length} imported ${dupes.length === 1 ? "person looks" : "people look"} like ${dupes.length === 1 ? "a duplicate" : "duplicates"} of someone already in your tree:\n${names}\n\nOK — skip those and import the rest\nCancel — import everyone anyway (merge manually later)`
+        );
+        if (skipDupes) toAdd = imported.filter((ip) => !dupes.includes(ip));
+      }
+      if (toAdd.length === 0) return;
+
+      const prevSnapshot = people;
+      pushBackup(prevSnapshot);
+      updatePeople((prev) => [...prev, ...toAdd]);
+      pushUndo(`Imported ${toAdd.length} from GEDCOM`, prevSnapshot);
     } catch (e) {
       window.alert("That file couldn't be read as GEDCOM.");
     }
   };
+  const restoreBackup = (backup) => {
+    const ok = window.confirm(`Restore the tree from ${new Date(backup.ts).toLocaleString()}? This replaces what's currently on screen (your current version isn't lost — it's in Backups too).`);
+    if (!ok) return;
+    const prevSnapshot = people;
+    pushBackup(prevSnapshot);
+    updatePeople(normalizePeople(backup.people));
+    setShowBackups(false);
+    pushUndo("Restored from backup", prevSnapshot);
+  };
 
   const selected = selectedId ? byId[selectedId] : null;
-  const q = query.trim().toLowerCase();
 
   if (loading) {
     return (
@@ -695,7 +875,7 @@ export default function KtreeApp() {
           <div className="ktree-sub">Add relatives, connect them, and watch the generations line up.</div>
         </div>
         <div className="ktree-header-actions">
-          <button className="ktree-icon-btn" onClick={toggleTheme} title="Toggle theme">
+          <button className="ktree-icon-btn" onClick={toggleTheme} title="Toggle theme" aria-label="Toggle light/dark theme">
             {theme === "light" ? <Moon size={16} /> : <Sun size={16} />}
           </button>
         </div>
@@ -721,6 +901,7 @@ export default function KtreeApp() {
             <input ref={jsonInputRef} type="file" accept="application/json" style={{ display: "none" }}
               onChange={(e) => { onImportJSON(e.target.files?.[0]); e.target.value = ""; }} />
             <button className="ktree-btn ktree-btn-ghost" onClick={() => window.print()}>Print / PDF</button>
+            <button className="ktree-btn ktree-btn-ghost" onClick={() => setShowBackups(true)}>Backups</button>
           </>
         )}
         {people.length > 0 && <span className="ktree-count">{people.length} {people.length === 1 ? "person" : "people"}</span>}
@@ -734,10 +915,10 @@ export default function KtreeApp() {
             <span><i className="dashed" style={{ borderColor: "var(--sage)" }} /> divorced</span>
           </div>
           <div className="ktree-zoom-bar">
-            <button className="ktree-icon-btn" onClick={zoomOut} title="Zoom out"><ZoomOut size={15} /></button>
+            <button className="ktree-icon-btn" onClick={zoomOut} title="Zoom out" aria-label="Zoom out"><ZoomOut size={15} /></button>
             <span className="ktree-zoom-pct">{Math.round(zoom * 100)}%</span>
-            <button className="ktree-icon-btn" onClick={zoomIn} title="Zoom in"><ZoomIn size={15} /></button>
-            <button className="ktree-icon-btn" onClick={zoomReset} title="Reset zoom"><Maximize2 size={14} /></button>
+            <button className="ktree-icon-btn" onClick={zoomIn} title="Zoom in" aria-label="Zoom in"><ZoomIn size={15} /></button>
+            <button className="ktree-icon-btn" onClick={zoomReset} title="Reset zoom" aria-label="Reset zoom"><Maximize2 size={14} /></button>
           </div>
         </>
       )}
@@ -780,6 +961,9 @@ export default function KtreeApp() {
                           ref={(el) => { if (el) cardRefs.current.set(id, el); else cardRefs.current.delete(id); }}
                           className={"ktree-card" + (dim ? " dim" : "") + (matches ? " match" : "") + (selectedId === id ? " selected" : "")}
                           onClick={() => setSelectedId(id)}
+                          role="button" tabIndex={0}
+                          aria-label={`${p.name}${years ? ", " + years : ""}`}
+                          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setSelectedId(id); } }}
                         >
                           {p.photo ? <img className="ktree-avatar" src={p.photo} alt="" /> : <div className="ktree-avatar">{initials(p.name)}</div>}
                           <div className="ktree-card-text">
@@ -810,13 +994,20 @@ export default function KtreeApp() {
                   )}
                 </div>
               </div>
-              <button className="ktree-close" onClick={() => setSelectedId(null)}><X size={18} /></button>
+              <button className="ktree-close" onClick={() => setSelectedId(null)} aria-label="Close"><X size={18} /></button>
             </div>
 
             <div className="ktree-panel-actions">
               <button className="ktree-btn ktree-btn-ghost ktree-btn-sm" onClick={() => openEdit(selected)}><Pencil size={13} /> Edit</button>
               <button className="ktree-btn ktree-btn-danger ktree-btn-sm" onClick={() => deletePerson(selected.id)}><Trash2 size={13} /> Delete</button>
             </div>
+
+            {selected.notes && (
+              <div className="ktree-detail-section">
+                <div className="ktree-detail-label">Notes</div>
+                <div style={{ fontSize: 13.5, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{selected.notes}</div>
+              </div>
+            )}
 
             <div className="ktree-detail-section">
               <div className="ktree-detail-label">Parents</div>
@@ -837,6 +1028,37 @@ export default function KtreeApp() {
             </div>
 
             <div className="ktree-detail-section">
+              <div className="ktree-detail-label">Siblings</div>
+              {siblingsOf(selected.id, "full").length > 0 ? (
+                <div className="ktree-chip-row">
+                  {siblingsOf(selected.id, "full").map((s) => (
+                    <span key={s.id} className="ktree-chip-name ktree-chip" onClick={() => setSelectedId(s.id)}>{s.name} <ChevronRight size={12} /></span>
+                  ))}
+                </div>
+              ) : <div className="ktree-empty-note">{(selected.parents || []).length ? "No full siblings added yet." : "Add a parent first to link siblings."}</div>}
+              <div className="ktree-quick-actions">
+                <button
+                  className="ktree-btn ktree-btn-ghost ktree-btn-sm"
+                  disabled={!(selected.parents || []).length}
+                  onClick={() => openAdd({ parent1: (selected.parents || [])[0] || "", parent2: (selected.parents || [])[1] || "" })}
+                >
+                  <Plus size={13} /> Add sibling
+                </button>
+              </div>
+            </div>
+
+            {siblingsOf(selected.id, "half").length > 0 && (
+              <div className="ktree-detail-section">
+                <div className="ktree-detail-label">Half-siblings</div>
+                <div className="ktree-chip-row">
+                  {siblingsOf(selected.id, "half").map((s) => (
+                    <span key={s.id} className="ktree-chip-name ktree-chip" onClick={() => setSelectedId(s.id)}>{s.name} <ChevronRight size={12} /></span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="ktree-detail-section">
               <div className="ktree-detail-label">Partners</div>
               {(selected.partners || []).length > 0 ? (
                 <div className="ktree-chip-row">
@@ -844,7 +1066,8 @@ export default function KtreeApp() {
                     <span key={pt.id} className="ktree-chip">
                       <span className="ktree-chip-name" onClick={() => setSelectedId(pt.id)}>{byId[pt.id].name}</span>
                       <select value={pt.status} onChange={(e) => setPartnerStatus(selected.id, pt.id, e.target.value)}>
-                        <option value="married">Together</option>
+                        <option value="married">Married</option>
+                        <option value="partnered">Partnered</option>
                         <option value="divorced">Divorced</option>
                         <option value="widowed">Widowed</option>
                       </select>
@@ -886,6 +1109,17 @@ export default function KtreeApp() {
                 </button>
               </div>
             </div>
+
+            <div className="ktree-detail-section">
+              <div className="ktree-detail-label">Cousins</div>
+              {cousinsOf(selected.id).length > 0 ? (
+                <div className="ktree-chip-row">
+                  {cousinsOf(selected.id).map((c) => (
+                    <span key={c.id} className="ktree-chip-name ktree-chip" onClick={() => setSelectedId(c.id)}>{c.name} <ChevronRight size={12} /></span>
+                  ))}
+                </div>
+              ) : <div className="ktree-empty-note">None found yet — cousins are worked out automatically from parents and their siblings.</div>}
+            </div>
           </div>
         </div>
       )}
@@ -895,7 +1129,7 @@ export default function KtreeApp() {
           <div className="ktree-panel" onClick={(e) => e.stopPropagation()}>
             <div className="ktree-panel-head">
               <h2 className="ktree-panel-title ktree-serif">{form.mode === "add" ? "Add person" : "Edit person"}</h2>
-              <button className="ktree-close" onClick={closeForm}><X size={18} /></button>
+              <button className="ktree-close" onClick={closeForm} aria-label="Close"><X size={18} /></button>
             </div>
 
             <form onSubmit={submitForm}>
@@ -927,7 +1161,7 @@ export default function KtreeApp() {
                 <label>Parent</label>
                 <select value={form.values.parent1} onChange={(e) => setForm({ ...form, values: { ...form.values, parent1: e.target.value } })}>
                   <option value="">None</option>
-                  {people.filter((p) => p.id !== form.id).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  {people.filter((p) => p.id !== form.id && !blockedParentIds.has(p.id)).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
                 </select>
               </div>
 
@@ -935,7 +1169,7 @@ export default function KtreeApp() {
                 <label>Second parent</label>
                 <select value={form.values.parent2} onChange={(e) => setForm({ ...form, values: { ...form.values, parent2: e.target.value } })}>
                   <option value="">None</option>
-                  {people.filter((p) => p.id !== form.id && p.id !== form.values.parent1).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  {people.filter((p) => p.id !== form.id && p.id !== form.values.parent1 && !blockedParentIds.has(p.id)).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
                 </select>
               </div>
 
@@ -946,8 +1180,18 @@ export default function KtreeApp() {
                     <option value="">None</option>
                     {people.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
                   </select>
+                  <div className="ktree-field-hint">You can add more parents, siblings, or partners after creating this person — this is just a head start.</div>
                 </div>
               )}
+
+              <div className="ktree-field">
+                <label>Notes</label>
+                <textarea
+                  value={form.values.notes}
+                  onChange={(e) => setForm({ ...form, values: { ...form.values, notes: e.target.value } })}
+                  placeholder="Anything worth remembering — where they lived, stories, occupation…"
+                />
+              </div>
 
               <div className="ktree-panel-actions">
                 <button type="submit" className="ktree-btn ktree-btn-primary">{form.mode === "add" ? "Add to tree" : "Save changes"}</button>
@@ -955,6 +1199,43 @@ export default function KtreeApp() {
               </div>
             </form>
           </div>
+        </div>
+      )}
+
+      {showBackups && (
+        <div className="ktree-overlay" onClick={() => setShowBackups(false)}>
+          <div className="ktree-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="ktree-panel-head">
+              <h2 className="ktree-panel-title ktree-serif">Backups</h2>
+              <button className="ktree-close" onClick={() => setShowBackups(false)} aria-label="Close"><X size={18} /></button>
+            </div>
+            <p style={{ fontSize: 13.5, color: "var(--ink-soft)", lineHeight: 1.5, marginTop: 0 }}>
+              A snapshot is saved automatically before deletes and imports, so you can recover
+              from a mistake even after reloading the page. The last {MAX_BACKUPS} are kept, in this browser only.
+            </p>
+            {loadBackups().length > 0 ? (
+              loadBackups().map((b, i) => (
+                <div className="ktree-backup-item" key={b.ts}>
+                  <span className="ktree-backup-meta">
+                    {new Date(b.ts).toLocaleString()} · {b.people.length} {b.people.length === 1 ? "person" : "people"}
+                  </span>
+                  <button className="ktree-btn ktree-btn-ghost ktree-btn-sm" onClick={() => restoreBackup(b)}>Restore</button>
+                </div>
+              ))
+            ) : (
+              <div className="ktree-backup-empty">No backups yet — they'll appear here after your first delete or import.</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {undoState && (
+        <div className="ktree-toast" role="status">
+          <span>{undoState.label}</span>
+          <button className="ktree-toast-undo" onClick={restoreUndo}>Undo</button>
+          <button className="ktree-toast-close" aria-label="Dismiss" onClick={() => { setUndoState(null); if (undoTimerRef.current) clearTimeout(undoTimerRef.current); }}>
+            <X size={14} />
+          </button>
         </div>
       )}
     </div>
